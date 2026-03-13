@@ -40,6 +40,62 @@ func (b Binding) Resolve(t types.Term) types.Term {
 	}
 }
 
+// Compact creates a new binding containing only variables reachable from the given terms.
+// This is used after tail call optimization to discard accumulated internal variables.
+func (b Binding) Compact(terms []types.Term) Binding {
+	needed := make(map[string]bool)
+	for _, t := range terms {
+		b.collectReachableVars(t, needed)
+	}
+	c := make(Binding, len(needed))
+	for name := range needed {
+		if val, ok := b[name]; ok {
+			c[name] = val
+		}
+	}
+	return c
+}
+
+// CompactWithRoots is like Compact but also preserves variables listed in roots.
+func (b Binding) CompactWithRoots(terms []types.Term, roots []string) Binding {
+	needed := make(map[string]bool)
+	for _, t := range terms {
+		b.collectReachableVars(t, needed)
+	}
+	for _, name := range roots {
+		if !needed[name] {
+			needed[name] = true
+			if val, ok := b[name]; ok {
+				b.collectReachableVars(val, needed)
+			}
+		}
+	}
+	c := make(Binding, len(needed))
+	for name := range needed {
+		if val, ok := b[name]; ok {
+			c[name] = val
+		}
+	}
+	return c
+}
+
+func (b Binding) collectReachableVars(t types.Term, visited map[string]bool) {
+	switch v := t.(type) {
+	case *types.Variable:
+		if visited[v.Name] {
+			return
+		}
+		visited[v.Name] = true
+		if val, ok := b[v.Name]; ok {
+			b.collectReachableVars(val, visited)
+		}
+	case *types.Compound:
+		for _, arg := range v.Args {
+			b.collectReachableVars(arg, visited)
+		}
+	}
+}
+
 // Unify attempts to unify two terms, returning true if successful.
 func Unify(t1, t2 types.Term, b Binding) bool {
 	t1 = b.Resolve(t1)

@@ -13,21 +13,43 @@ import (
 // Engine is the Prolog inference engine.
 type Engine struct {
 	Database  []*types.Clause
+	Index     map[string][]*types.Clause // key = "functor/arity"
 	varCount  int
 	Output    io.Writer
 	CutSignal bool
+	rootVars  []string // user-visible query variables, preserved through compaction
 }
 
 // New creates a new Engine.
 func New() *Engine {
 	return &Engine{
 		Output: os.Stdout,
+		Index:  make(map[string][]*types.Clause),
 	}
+}
+
+func clauseKey(c *types.Clause) string {
+	return fmt.Sprintf("%s/%d", c.Head.Functor, len(c.Head.Args))
+}
+
+func goalKey(g *types.Compound) string {
+	return fmt.Sprintf("%s/%d", g.Functor, len(g.Args))
 }
 
 // AddClause adds a clause to the database.
 func (e *Engine) AddClause(c *types.Clause) {
 	e.Database = append(e.Database, c)
+	key := clauseKey(c)
+	e.Index[key] = append(e.Index[key], c)
+}
+
+// rebuildIndex rebuilds the functor/arity index from the database.
+func (e *Engine) rebuildIndex() {
+	e.Index = make(map[string][]*types.Clause)
+	for _, c := range e.Database {
+		key := clauseKey(c)
+		e.Index[key] = append(e.Index[key], c)
+	}
 }
 
 // freshVar generates a fresh variable name.
@@ -75,44 +97,104 @@ type Solution struct {
 // Solve finds all solutions for a list of goals.
 func (e *Engine) Solve(goals []types.Term, b Binding, callback func(Binding) bool) {
 	e.CutSignal = false
+	// Collect root variables to preserve through compaction
+	e.rootVars = collectTermVars(goals)
 	e.solve(goals, b, callback)
 }
 
 func (e *Engine) solve(goals []types.Term, b Binding, callback func(Binding) bool) bool {
-	if len(goals) == 0 {
-		return callback(b)
-	}
-
-	goal := b.Resolve(goals[0])
-	rest := goals[1:]
-
-	// Handle built-in predicates
-	if handled, stop := e.tryBuiltin(goal, rest, b, callback); handled {
-		return stop
-	}
-
-	// Convert atom to compound for matching
-	goalComp, ok := goalToCompound(goal)
-	if !ok {
-		fmt.Fprintf(e.Output, "Error: goal is not callable: %s\n", goal.String())
-		return false
-	}
-
-	// Search database
-	for _, clause := range e.Database {
-		if e.CutSignal {
-			return true
+	for {
+		if len(goals) == 0 {
+			return callback(b)
 		}
-		renamed := e.RenameVars(clause)
-		newB := b.Clone()
-		if Unify(goalComp, renamed.Head, newB) {
-			newGoals := append(renamed.Body, rest...)
+
+		goal := b.Resolve(goals[0])
+		rest := goals[1:]
+
+		// Handle built-in predicates
+		if result := e.tryBuiltin(goal, rest, b, callback); result.handled {
+			if result.contGoals != nil {
+				// TCO: continue loop with builtin's continuation
+				goals = result.contGoals
+				b = result.contBinding
+				continue
+			}
+			return result.stop
+		}
+
+		// Convert atom to compound for matching
+		goalComp, ok := goalToCompound(goal)
+		if !ok {
+			fmt.Fprintf(e.Output, "Error: goal is not callable: %s\n", goal.String())
+			return false
+		}
+
+		// Lookup candidates via functor/arity index
+		candidates := e.Index[goalKey(goalComp)]
+		if len(candidates) == 0 {
+			return false
+		}
+
+		// Try each candidate clause; use LCO for the last one
+		tailOptimized := false
+		for i, clause := range candidates {
+			if e.CutSignal {
+				return true
+			}
+			renamed := e.RenameVars(clause)
+			newB := b.Clone()
+			if !Unify(goalComp, renamed.Head, newB) {
+				continue
+			}
+
+			newGoals := make([]types.Term, 0, len(renamed.Body)+len(rest))
+			newGoals = append(newGoals, renamed.Body...)
+			newGoals = append(newGoals, rest...)
+
+			if i == len(candidates)-1 {
+				// Last Call Optimization: loop instead of recurse
+				// Compact binding to discard unreachable internal variables
+				goals = newGoals
+				b = newB.CompactWithRoots(newGoals, e.rootVars)
+				tailOptimized = true
+				break
+			}
+
+			// Not the last candidate: recurse (choice point)
 			if e.solve(newGoals, newB, callback) {
 				return true
 			}
 		}
+
+		if !tailOptimized {
+			return false
+		}
+		// Continue loop with updated goals/b (LCO)
 	}
-	return false
+}
+
+// collectTermVars collects all variable names from a list of terms.
+func collectTermVars(terms []types.Term) []string {
+	seen := make(map[string]bool)
+	var vars []string
+	for _, t := range terms {
+		collectTermVarsHelper(t, seen, &vars)
+	}
+	return vars
+}
+
+func collectTermVarsHelper(t types.Term, seen map[string]bool, vars *[]string) {
+	switch v := t.(type) {
+	case *types.Variable:
+		if !seen[v.Name] {
+			seen[v.Name] = true
+			*vars = append(*vars, v.Name)
+		}
+	case *types.Compound:
+		for _, a := range v.Args {
+			collectTermVarsHelper(a, seen, vars)
+		}
+	}
 }
 
 func goalToCompound(t types.Term) (*types.Compound, bool) {
@@ -126,37 +208,56 @@ func goalToCompound(t types.Term) (*types.Compound, bool) {
 	}
 }
 
-func (e *Engine) tryBuiltin(goal types.Term, rest []types.Term, b Binding, callback func(Binding) bool) (handled bool, stop bool) {
+// builtinResult represents the result of a builtin predicate evaluation.
+type builtinResult struct {
+	handled     bool
+	stop        bool
+	contGoals   []types.Term // if non-nil, continue solve loop with these goals (TCO)
+	contBinding Binding      // binding to use with contGoals
+}
+
+func brNotHandled() builtinResult { return builtinResult{} }
+func brFail() builtinResult       { return builtinResult{handled: true} }
+func brStop(stop bool) builtinResult {
+	return builtinResult{handled: true, stop: stop}
+}
+func brContinue(goals []types.Term, b Binding) builtinResult {
+	return builtinResult{handled: true, contGoals: goals, contBinding: b}
+}
+
+func (e *Engine) tryBuiltin(goal types.Term, rest []types.Term, b Binding, callback func(Binding) bool) builtinResult {
 	switch g := goal.(type) {
 	case *types.Atom:
 		switch g.Name {
 		case "true":
-			return true, e.solve(rest, b, callback)
+			return brContinue(rest, b)
 		case "fail", "false":
-			return true, false
+			return brFail()
 		case "!":
 			stop := e.solve(rest, b, callback)
 			e.CutSignal = true
-			return true, stop
+			return brStop(stop)
 		case "nl":
 			fmt.Fprintln(e.Output)
-			return true, e.solve(rest, b, callback)
+			return brContinue(rest, b)
 		case "halt":
 			os.Exit(0)
-			return true, true
+			return brStop(true)
 		case "listing":
 			for _, c := range e.Database {
 				fmt.Fprintln(e.Output, c.String())
 			}
-			return true, e.solve(rest, b, callback)
+			return brContinue(rest, b)
 		}
 
 	case *types.Compound:
 		switch g.Functor {
 		case ",":
 			if len(g.Args) == 2 {
-				newGoals := append([]types.Term{g.Args[0], g.Args[1]}, rest...)
-				return true, e.solve(newGoals, b, callback)
+				newGoals := make([]types.Term, 0, 2+len(rest))
+				newGoals = append(newGoals, g.Args[0], g.Args[1])
+				newGoals = append(newGoals, rest...)
+				return brContinue(newGoals, b)
 			}
 
 		case ";":
@@ -172,17 +273,17 @@ func (e *Engine) tryBuiltin(goal types.Term, rest []types.Term, b Binding, callb
 					})
 					if !found {
 						newGoals := append([]types.Term{g.Args[1]}, rest...)
-						return true, e.solve(newGoals, b, callback)
+						return brStop(e.solve(newGoals, b, callback))
 					}
-					return true, false
+					return brFail()
 				}
 				// Regular disjunction
 				newGoals1 := append([]types.Term{g.Args[0]}, rest...)
 				if e.solve(newGoals1, b.Clone(), callback) {
-					return true, true
+					return brStop(true)
 				}
 				newGoals2 := append([]types.Term{g.Args[1]}, rest...)
-				return true, e.solve(newGoals2, b.Clone(), callback)
+				return brStop(e.solve(newGoals2, b.Clone(), callback))
 			}
 
 		case "->":
@@ -192,7 +293,7 @@ func (e *Engine) tryBuiltin(goal types.Term, rest []types.Term, b Binding, callb
 					e.solve(newGoals, b2, callback)
 					return true // Only first solution
 				})
-				return true, false
+				return brFail()
 			}
 
 		case "\\+":
@@ -204,27 +305,27 @@ func (e *Engine) tryBuiltin(goal types.Term, rest []types.Term, b Binding, callb
 					return true
 				})
 				if !found {
-					return true, e.solve(rest, b, callback)
+					return brContinue(rest, b)
 				}
-				return true, false
+				return brFail()
 			}
 
 		case "=":
 			if len(g.Args) == 2 {
 				newB := b.Clone()
 				if Unify(g.Args[0], g.Args[1], newB) {
-					return true, e.solve(rest, newB, callback)
+					return brContinue(rest, newB)
 				}
-				return true, false
+				return brFail()
 			}
 
 		case "\\=":
 			if len(g.Args) == 2 {
 				testB := b.Clone()
 				if !Unify(g.Args[0], g.Args[1], testB) {
-					return true, e.solve(rest, b, callback)
+					return brContinue(rest, b)
 				}
-				return true, false
+				return brFail()
 			}
 
 		case "==":
@@ -232,9 +333,9 @@ func (e *Engine) tryBuiltin(goal types.Term, rest []types.Term, b Binding, callb
 				t1 := b.Resolve(g.Args[0])
 				t2 := b.Resolve(g.Args[1])
 				if t1.Equal(t2) {
-					return true, e.solve(rest, b, callback)
+					return brContinue(rest, b)
 				}
-				return true, false
+				return brFail()
 			}
 
 		case "\\==":
@@ -242,9 +343,9 @@ func (e *Engine) tryBuiltin(goal types.Term, rest []types.Term, b Binding, callb
 				t1 := b.Resolve(g.Args[0])
 				t2 := b.Resolve(g.Args[1])
 				if !t1.Equal(t2) {
-					return true, e.solve(rest, b, callback)
+					return brContinue(rest, b)
 				}
-				return true, false
+				return brFail()
 			}
 
 		case "is":
@@ -252,13 +353,13 @@ func (e *Engine) tryBuiltin(goal types.Term, rest []types.Term, b Binding, callb
 				val, err := e.evalArith(g.Args[1], b)
 				if err != nil {
 					fmt.Fprintf(e.Output, "Error: %v\n", err)
-					return true, false
+					return brFail()
 				}
 				newB := b.Clone()
 				if Unify(g.Args[0], val, newB) {
-					return true, e.solve(rest, newB, callback)
+					return brContinue(rest, newB)
 				}
-				return true, false
+				return brFail()
 			}
 
 		case "=:=":
@@ -266,12 +367,12 @@ func (e *Engine) tryBuiltin(goal types.Term, rest []types.Term, b Binding, callb
 				v1, err1 := e.evalArith(g.Args[0], b)
 				v2, err2 := e.evalArith(g.Args[1], b)
 				if err1 != nil || err2 != nil {
-					return true, false
+					return brFail()
 				}
 				if toFloat(v1) == toFloat(v2) {
-					return true, e.solve(rest, b, callback)
+					return brContinue(rest, b)
 				}
-				return true, false
+				return brFail()
 			}
 
 		case "=\\=":
@@ -279,12 +380,12 @@ func (e *Engine) tryBuiltin(goal types.Term, rest []types.Term, b Binding, callb
 				v1, err1 := e.evalArith(g.Args[0], b)
 				v2, err2 := e.evalArith(g.Args[1], b)
 				if err1 != nil || err2 != nil {
-					return true, false
+					return brFail()
 				}
 				if toFloat(v1) != toFloat(v2) {
-					return true, e.solve(rest, b, callback)
+					return brContinue(rest, b)
 				}
-				return true, false
+				return brFail()
 			}
 
 		case "<":
@@ -292,12 +393,12 @@ func (e *Engine) tryBuiltin(goal types.Term, rest []types.Term, b Binding, callb
 				v1, err1 := e.evalArith(g.Args[0], b)
 				v2, err2 := e.evalArith(g.Args[1], b)
 				if err1 != nil || err2 != nil {
-					return true, false
+					return brFail()
 				}
 				if toFloat(v1) < toFloat(v2) {
-					return true, e.solve(rest, b, callback)
+					return brContinue(rest, b)
 				}
-				return true, false
+				return brFail()
 			}
 
 		case ">":
@@ -305,12 +406,12 @@ func (e *Engine) tryBuiltin(goal types.Term, rest []types.Term, b Binding, callb
 				v1, err1 := e.evalArith(g.Args[0], b)
 				v2, err2 := e.evalArith(g.Args[1], b)
 				if err1 != nil || err2 != nil {
-					return true, false
+					return brFail()
 				}
 				if toFloat(v1) > toFloat(v2) {
-					return true, e.solve(rest, b, callback)
+					return brContinue(rest, b)
 				}
-				return true, false
+				return brFail()
 			}
 
 		case "=<":
@@ -318,12 +419,12 @@ func (e *Engine) tryBuiltin(goal types.Term, rest []types.Term, b Binding, callb
 				v1, err1 := e.evalArith(g.Args[0], b)
 				v2, err2 := e.evalArith(g.Args[1], b)
 				if err1 != nil || err2 != nil {
-					return true, false
+					return brFail()
 				}
 				if toFloat(v1) <= toFloat(v2) {
-					return true, e.solve(rest, b, callback)
+					return brContinue(rest, b)
 				}
-				return true, false
+				return brFail()
 			}
 
 		case ">=":
@@ -331,42 +432,42 @@ func (e *Engine) tryBuiltin(goal types.Term, rest []types.Term, b Binding, callb
 				v1, err1 := e.evalArith(g.Args[0], b)
 				v2, err2 := e.evalArith(g.Args[1], b)
 				if err1 != nil || err2 != nil {
-					return true, false
+					return brFail()
 				}
 				if toFloat(v1) >= toFloat(v2) {
-					return true, e.solve(rest, b, callback)
+					return brContinue(rest, b)
 				}
-				return true, false
+				return brFail()
 			}
 
 		case "write":
 			if len(g.Args) == 1 {
 				resolved := b.Resolve(g.Args[0])
 				fmt.Fprint(e.Output, termToString(resolved))
-				return true, e.solve(rest, b, callback)
+				return brContinue(rest, b)
 			}
 
 		case "writeln":
 			if len(g.Args) == 1 {
 				resolved := b.Resolve(g.Args[0])
 				fmt.Fprintln(e.Output, termToString(resolved))
-				return true, e.solve(rest, b, callback)
+				return brContinue(rest, b)
 			}
 
 		case "write_canonical":
 			if len(g.Args) == 1 {
 				resolved := b.Resolve(g.Args[0])
 				fmt.Fprint(e.Output, resolved.String())
-				return true, e.solve(rest, b, callback)
+				return brContinue(rest, b)
 			}
 
 		case "atom":
 			if len(g.Args) == 1 {
 				resolved := b.Resolve(g.Args[0])
 				if _, ok := resolved.(*types.Atom); ok {
-					return true, e.solve(rest, b, callback)
+					return brContinue(rest, b)
 				}
-				return true, false
+				return brFail()
 			}
 
 		case "number":
@@ -374,63 +475,63 @@ func (e *Engine) tryBuiltin(goal types.Term, rest []types.Term, b Binding, callb
 				resolved := b.Resolve(g.Args[0])
 				switch resolved.(type) {
 				case *types.Number, *types.Float:
-					return true, e.solve(rest, b, callback)
+					return brContinue(rest, b)
 				}
-				return true, false
+				return brFail()
 			}
 
 		case "integer":
 			if len(g.Args) == 1 {
 				resolved := b.Resolve(g.Args[0])
 				if _, ok := resolved.(*types.Number); ok {
-					return true, e.solve(rest, b, callback)
+					return brContinue(rest, b)
 				}
-				return true, false
+				return brFail()
 			}
 
 		case "float":
 			if len(g.Args) == 1 {
 				resolved := b.Resolve(g.Args[0])
 				if _, ok := resolved.(*types.Float); ok {
-					return true, e.solve(rest, b, callback)
+					return brContinue(rest, b)
 				}
-				return true, false
+				return brFail()
 			}
 
 		case "var":
 			if len(g.Args) == 1 {
 				resolved := b.Resolve(g.Args[0])
 				if _, ok := resolved.(*types.Variable); ok {
-					return true, e.solve(rest, b, callback)
+					return brContinue(rest, b)
 				}
-				return true, false
+				return brFail()
 			}
 
 		case "nonvar":
 			if len(g.Args) == 1 {
 				resolved := b.Resolve(g.Args[0])
 				if _, ok := resolved.(*types.Variable); !ok {
-					return true, e.solve(rest, b, callback)
+					return brContinue(rest, b)
 				}
-				return true, false
+				return brFail()
 			}
 
 		case "compound":
 			if len(g.Args) == 1 {
 				resolved := b.Resolve(g.Args[0])
 				if c, ok := resolved.(*types.Compound); ok && len(c.Args) > 0 {
-					return true, e.solve(rest, b, callback)
+					return brContinue(rest, b)
 				}
-				return true, false
+				return brFail()
 			}
 
 		case "is_list":
 			if len(g.Args) == 1 {
 				resolved := b.Resolve(g.Args[0])
 				if isList(resolved) {
-					return true, e.solve(rest, b, callback)
+					return brContinue(rest, b)
 				}
-				return true, false
+				return brFail()
 			}
 
 		case "assert", "assertz":
@@ -438,10 +539,10 @@ func (e *Engine) tryBuiltin(goal types.Term, rest []types.Term, b Binding, callb
 				resolved := b.Resolve(g.Args[0])
 				clause := termToClause(resolved)
 				if clause != nil {
-					e.Database = append(e.Database, clause)
-					return true, e.solve(rest, b, callback)
+					e.AddClause(clause)
+					return brContinue(rest, b)
 				}
-				return true, false
+				return brFail()
 			}
 
 		case "asserta":
@@ -450,9 +551,10 @@ func (e *Engine) tryBuiltin(goal types.Term, rest []types.Term, b Binding, callb
 				clause := termToClause(resolved)
 				if clause != nil {
 					e.Database = append([]*types.Clause{clause}, e.Database...)
-					return true, e.solve(rest, b, callback)
+					e.rebuildIndex()
+					return brContinue(rest, b)
 				}
-				return true, false
+				return brFail()
 			}
 
 		case "retract":
@@ -460,17 +562,18 @@ func (e *Engine) tryBuiltin(goal types.Term, rest []types.Term, b Binding, callb
 				resolved := b.Resolve(g.Args[0])
 				target := termToClause(resolved)
 				if target == nil {
-					return true, false
+					return brFail()
 				}
 				for i, c := range e.Database {
 					newB := b.Clone()
 					renamed := e.RenameVars(c)
 					if Unify(target.Head, renamed.Head, newB) && matchBody(target.Body, renamed.Body, newB) {
 						e.Database = append(e.Database[:i], e.Database[i+1:]...)
-						return true, e.solve(rest, newB, callback)
+						e.rebuildIndex()
+						return brContinue(rest, newB)
 					}
 				}
-				return true, false
+				return brFail()
 			}
 
 		case "functor":
@@ -480,19 +583,19 @@ func (e *Engine) tryBuiltin(goal types.Term, rest []types.Term, b Binding, callb
 				switch v := resolved.(type) {
 				case *types.Atom:
 					if Unify(g.Args[1], v, newB) && Unify(g.Args[2], types.MakeNumber(0), newB) {
-						return true, e.solve(rest, newB, callback)
+						return brContinue(rest, newB)
 					}
-					return true, false
+					return brFail()
 				case *types.Number:
 					if Unify(g.Args[1], v, newB) && Unify(g.Args[2], types.MakeNumber(0), newB) {
-						return true, e.solve(rest, newB, callback)
+						return brContinue(rest, newB)
 					}
-					return true, false
+					return brFail()
 				case *types.Compound:
 					if Unify(g.Args[1], types.MakeAtom(v.Functor), newB) && Unify(g.Args[2], types.MakeNumber(int64(len(v.Args))), newB) {
-						return true, e.solve(rest, newB, callback)
+						return brContinue(rest, newB)
 					}
-					return true, false
+					return brFail()
 				case *types.Variable:
 					// functor(X, f, N) — construct term
 					fAtom := b.Resolve(g.Args[1])
@@ -501,7 +604,7 @@ func (e *Engine) tryBuiltin(goal types.Term, rest []types.Term, b Binding, callb
 						if n, ok := nNum.(*types.Number); ok {
 							if n.Value == 0 {
 								if Unify(g.Args[0], a, newB) {
-									return true, e.solve(rest, newB, callback)
+									return brContinue(rest, newB)
 								}
 							} else {
 								args := make([]types.Term, n.Value)
@@ -510,12 +613,12 @@ func (e *Engine) tryBuiltin(goal types.Term, rest []types.Term, b Binding, callb
 								}
 								comp := types.MakeCompound(a.Name, args...)
 								if Unify(g.Args[0], comp, newB) {
-									return true, e.solve(rest, newB, callback)
+									return brContinue(rest, newB)
 								}
 							}
 						}
 					}
-					return true, false
+					return brFail()
 				}
 			}
 
@@ -529,12 +632,12 @@ func (e *Engine) tryBuiltin(goal types.Term, rest []types.Term, b Binding, callb
 						if idx >= 1 && idx <= len(comp.Args) {
 							newB := b.Clone()
 							if Unify(g.Args[2], comp.Args[idx-1], newB) {
-								return true, e.solve(rest, newB, callback)
+								return brContinue(rest, newB)
 							}
 						}
 					}
 				}
-				return true, false
+				return brFail()
 			}
 
 		case "copy_term":
@@ -544,9 +647,9 @@ func (e *Engine) tryBuiltin(goal types.Term, rest []types.Term, b Binding, callb
 				copied := e.copyTerm(original, mapping)
 				newB := b.Clone()
 				if Unify(g.Args[1], copied, newB) {
-					return true, e.solve(rest, newB, callback)
+					return brContinue(rest, newB)
 				}
-				return true, false
+				return brFail()
 			}
 
 		case "=..":
@@ -559,46 +662,46 @@ func (e *Engine) tryBuiltin(goal types.Term, rest []types.Term, b Binding, callb
 					elems = append(elems, v.Args...)
 					list := types.MakeList(elems...)
 					if Unify(g.Args[1], list, newB) {
-						return true, e.solve(rest, newB, callback)
+						return brContinue(rest, newB)
 					}
-					return true, false
+					return brFail()
 				case *types.Atom:
 					list := types.MakeList(v)
 					if Unify(g.Args[1], list, newB) {
-						return true, e.solve(rest, newB, callback)
+						return brContinue(rest, newB)
 					}
-					return true, false
+					return brFail()
 				case *types.Number:
 					list := types.MakeList(v)
 					if Unify(g.Args[1], list, newB) {
-						return true, e.solve(rest, newB, callback)
+						return brContinue(rest, newB)
 					}
-					return true, false
+					return brFail()
 				case *types.Variable:
 					// Construct from list
 					listTerm := b.Resolve(g.Args[1])
 					elems := listToSlice(listTerm)
 					if elems == nil {
-						return true, false
+						return brFail()
 					}
 					if len(elems) == 0 {
-						return true, false
+						return brFail()
 					}
 					functor, ok := elems[0].(*types.Atom)
 					if !ok {
-						return true, false
+						return brFail()
 					}
 					if len(elems) == 1 {
 						if Unify(g.Args[0], functor, newB) {
-							return true, e.solve(rest, newB, callback)
+							return brContinue(rest, newB)
 						}
 					} else {
 						comp := types.MakeCompound(functor.Name, elems[1:]...)
 						if Unify(g.Args[0], comp, newB) {
-							return true, e.solve(rest, newB, callback)
+							return brContinue(rest, newB)
 						}
 					}
-					return true, false
+					return brFail()
 				}
 			}
 
@@ -609,10 +712,10 @@ func (e *Engine) tryBuiltin(goal types.Term, rest []types.Term, b Binding, callb
 				if elems != nil {
 					newB := b.Clone()
 					if Unify(g.Args[1], types.MakeNumber(int64(len(elems))), newB) {
-						return true, e.solve(rest, newB, callback)
+						return brContinue(rest, newB)
 					}
 				}
-				return true, false
+				return brFail()
 			}
 
 		case "append":
@@ -622,14 +725,14 @@ func (e *Engine) tryBuiltin(goal types.Term, rest []types.Term, b Binding, callb
 				l1 := b.Resolve(g.Args[0])
 				l2 := b.Resolve(g.Args[1])
 				l3 := b.Resolve(g.Args[2])
-				return true, e.solveAppend(l1, l2, l3, rest, b, callback)
+				return brStop(e.solveAppend(l1, l2, l3, rest, b, callback))
 			}
 
 		case "member":
 			if len(g.Args) == 2 {
 				elem := g.Args[0]
 				list := b.Resolve(g.Args[1])
-				return true, e.solveMember(elem, list, rest, b, callback)
+				return brStop(e.solveMember(elem, list, rest, b, callback))
 			}
 
 		case "between":
@@ -637,22 +740,22 @@ func (e *Engine) tryBuiltin(goal types.Term, rest []types.Term, b Binding, callb
 				low, err1 := e.evalArith(g.Args[0], b)
 				high, err2 := e.evalArith(g.Args[1], b)
 				if err1 != nil || err2 != nil {
-					return true, false
+					return brFail()
 				}
 				lowN, ok1 := low.(*types.Number)
 				highN, ok2 := high.(*types.Number)
 				if !ok1 || !ok2 {
-					return true, false
+					return brFail()
 				}
 				for i := lowN.Value; i <= highN.Value; i++ {
 					newB := b.Clone()
 					if Unify(g.Args[2], types.MakeNumber(i), newB) {
 						if e.solve(rest, newB, callback) {
-							return true, true
+							return brStop(true)
 						}
 					}
 				}
-				return true, false
+				return brFail()
 			}
 
 		case "succ":
@@ -663,20 +766,20 @@ func (e *Engine) tryBuiltin(goal types.Term, rest []types.Term, b Binding, callb
 				if n, ok := x.(*types.Number); ok {
 					if n.Value >= 0 {
 						if Unify(g.Args[1], types.MakeNumber(n.Value+1), newB) {
-							return true, e.solve(rest, newB, callback)
+							return brContinue(rest, newB)
 						}
 					}
-					return true, false
+					return brFail()
 				}
 				if n, ok := y.(*types.Number); ok {
 					if n.Value > 0 {
 						if Unify(g.Args[0], types.MakeNumber(n.Value-1), newB) {
-							return true, e.solve(rest, newB, callback)
+							return brContinue(rest, newB)
 						}
 					}
-					return true, false
+					return brFail()
 				}
-				return true, false
+				return brFail()
 			}
 
 		case "plus":
@@ -688,26 +791,26 @@ func (e *Engine) tryBuiltin(goal types.Term, rest []types.Term, b Binding, callb
 				if xn, ok := x.(*types.Number); ok {
 					if yn, ok := y.(*types.Number); ok {
 						if Unify(g.Args[2], types.MakeNumber(xn.Value+yn.Value), newB) {
-							return true, e.solve(rest, newB, callback)
+							return brContinue(rest, newB)
 						}
-						return true, false
+						return brFail()
 					}
 					if zn, ok := z.(*types.Number); ok {
 						if Unify(g.Args[1], types.MakeNumber(zn.Value-xn.Value), newB) {
-							return true, e.solve(rest, newB, callback)
+							return brContinue(rest, newB)
 						}
-						return true, false
+						return brFail()
 					}
 				}
 				if yn, ok := y.(*types.Number); ok {
 					if zn, ok := z.(*types.Number); ok {
 						if Unify(g.Args[0], types.MakeNumber(zn.Value-yn.Value), newB) {
-							return true, e.solve(rest, newB, callback)
+							return brContinue(rest, newB)
 						}
-						return true, false
+						return brFail()
 					}
 				}
-				return true, false
+				return brFail()
 			}
 
 		case "atom_chars":
@@ -722,9 +825,9 @@ func (e *Engine) tryBuiltin(goal types.Term, rest []types.Term, b Binding, callb
 					}
 					list := types.MakeList(terms...)
 					if Unify(g.Args[1], list, newB) {
-						return true, e.solve(rest, newB, callback)
+						return brContinue(rest, newB)
 					}
-					return true, false
+					return brFail()
 				}
 				// Reverse: chars -> atom
 				listTerm := b.Resolve(g.Args[1])
@@ -735,14 +838,14 @@ func (e *Engine) tryBuiltin(goal types.Term, rest []types.Term, b Binding, callb
 						if a, ok := elem.(*types.Atom); ok {
 							sb.WriteString(a.Name)
 						} else {
-							return true, false
+							return brFail()
 						}
 					}
 					if Unify(g.Args[0], types.MakeAtom(sb.String()), newB) {
-						return true, e.solve(rest, newB, callback)
+						return brContinue(rest, newB)
 					}
 				}
-				return true, false
+				return brFail()
 			}
 
 		case "atom_length":
@@ -751,10 +854,10 @@ func (e *Engine) tryBuiltin(goal types.Term, rest []types.Term, b Binding, callb
 				if a, ok := resolved.(*types.Atom); ok {
 					newB := b.Clone()
 					if Unify(g.Args[1], types.MakeNumber(int64(len([]rune(a.Name)))), newB) {
-						return true, e.solve(rest, newB, callback)
+						return brContinue(rest, newB)
 					}
 				}
-				return true, false
+				return brFail()
 			}
 
 		case "atom_concat":
@@ -765,11 +868,11 @@ func (e *Engine) tryBuiltin(goal types.Term, rest []types.Term, b Binding, callb
 					if at2, ok := a2.(*types.Atom); ok {
 						newB := b.Clone()
 						if Unify(g.Args[2], types.MakeAtom(at1.Name+at2.Name), newB) {
-							return true, e.solve(rest, newB, callback)
+							return brContinue(rest, newB)
 						}
 					}
 				}
-				return true, false
+				return brFail()
 			}
 
 		case "number_chars":
@@ -785,10 +888,10 @@ func (e *Engine) tryBuiltin(goal types.Term, rest []types.Term, b Binding, callb
 					list := types.MakeList(terms...)
 					newB := b.Clone()
 					if Unify(g.Args[1], list, newB) {
-						return true, e.solve(rest, newB, callback)
+						return brContinue(rest, newB)
 					}
 				}
-				return true, false
+				return brFail()
 			}
 
 		case "char_code":
@@ -798,18 +901,18 @@ func (e *Engine) tryBuiltin(goal types.Term, rest []types.Term, b Binding, callb
 				if a, ok := resolved.(*types.Atom); ok && len([]rune(a.Name)) == 1 {
 					code := int64([]rune(a.Name)[0])
 					if Unify(g.Args[1], types.MakeNumber(code), newB) {
-						return true, e.solve(rest, newB, callback)
+						return brContinue(rest, newB)
 					}
-					return true, false
+					return brFail()
 				}
 				code := b.Resolve(g.Args[1])
 				if n, ok := code.(*types.Number); ok {
 					ch := string(rune(n.Value))
 					if Unify(g.Args[0], types.MakeAtom(ch), newB) {
-						return true, e.solve(rest, newB, callback)
+						return brContinue(rest, newB)
 					}
 				}
-				return true, false
+				return brFail()
 			}
 
 		case "findall":
@@ -826,9 +929,9 @@ func (e *Engine) tryBuiltin(goal types.Term, rest []types.Term, b Binding, callb
 				list := types.MakeList(results...)
 				newB := b.Clone()
 				if Unify(resultList, list, newB) {
-					return true, e.solve(rest, newB, callback)
+					return brContinue(rest, newB)
 				}
-				return true, false
+				return brFail()
 			}
 
 		case "msort":
@@ -840,10 +943,10 @@ func (e *Engine) tryBuiltin(goal types.Term, rest []types.Term, b Binding, callb
 					list := types.MakeList(sorted...)
 					newB := b.Clone()
 					if Unify(g.Args[1], list, newB) {
-						return true, e.solve(rest, newB, callback)
+						return brContinue(rest, newB)
 					}
 				}
-				return true, false
+				return brFail()
 			}
 
 		case "sort":
@@ -857,10 +960,10 @@ func (e *Engine) tryBuiltin(goal types.Term, rest []types.Term, b Binding, callb
 					list := types.MakeList(unique...)
 					newB := b.Clone()
 					if Unify(g.Args[1], list, newB) {
-						return true, e.solve(rest, newB, callback)
+						return brContinue(rest, newB)
 					}
 				}
-				return true, false
+				return brFail()
 			}
 
 		case "last":
@@ -870,10 +973,10 @@ func (e *Engine) tryBuiltin(goal types.Term, rest []types.Term, b Binding, callb
 				if elems != nil && len(elems) > 0 {
 					newB := b.Clone()
 					if Unify(g.Args[1], elems[len(elems)-1], newB) {
-						return true, e.solve(rest, newB, callback)
+						return brContinue(rest, newB)
 					}
 				}
-				return true, false
+				return brFail()
 			}
 
 		case "reverse":
@@ -888,10 +991,10 @@ func (e *Engine) tryBuiltin(goal types.Term, rest []types.Term, b Binding, callb
 					list := types.MakeList(reversed...)
 					newB := b.Clone()
 					if Unify(g.Args[1], list, newB) {
-						return true, e.solve(rest, newB, callback)
+						return brContinue(rest, newB)
 					}
 				}
-				return true, false
+				return brFail()
 			}
 
 		case "nth0":
@@ -899,7 +1002,7 @@ func (e *Engine) tryBuiltin(goal types.Term, rest []types.Term, b Binding, callb
 				resolved := b.Resolve(g.Args[1])
 				elems := listToSlice(resolved)
 				if elems == nil {
-					return true, false
+					return brFail()
 				}
 				idxTerm := b.Resolve(g.Args[0])
 				if n, ok := idxTerm.(*types.Number); ok {
@@ -907,10 +1010,10 @@ func (e *Engine) tryBuiltin(goal types.Term, rest []types.Term, b Binding, callb
 					if idx >= 0 && idx < len(elems) {
 						newB := b.Clone()
 						if Unify(g.Args[2], elems[idx], newB) {
-							return true, e.solve(rest, newB, callback)
+							return brContinue(rest, newB)
 						}
 					}
-					return true, false
+					return brFail()
 				}
 				// Enumerate
 				for i, elem := range elems {
@@ -918,11 +1021,11 @@ func (e *Engine) tryBuiltin(goal types.Term, rest []types.Term, b Binding, callb
 					if Unify(g.Args[0], types.MakeNumber(int64(i)), newB) &&
 						Unify(g.Args[2], elem, newB) {
 						if e.solve(rest, newB, callback) {
-							return true, true
+							return brStop(true)
 						}
 					}
 				}
-				return true, false
+				return brFail()
 			}
 
 		case "nth1":
@@ -930,7 +1033,7 @@ func (e *Engine) tryBuiltin(goal types.Term, rest []types.Term, b Binding, callb
 				resolved := b.Resolve(g.Args[1])
 				elems := listToSlice(resolved)
 				if elems == nil {
-					return true, false
+					return brFail()
 				}
 				idxTerm := b.Resolve(g.Args[0])
 				if n, ok := idxTerm.(*types.Number); ok {
@@ -938,26 +1041,26 @@ func (e *Engine) tryBuiltin(goal types.Term, rest []types.Term, b Binding, callb
 					if idx >= 0 && idx < len(elems) {
 						newB := b.Clone()
 						if Unify(g.Args[2], elems[idx], newB) {
-							return true, e.solve(rest, newB, callback)
+							return brContinue(rest, newB)
 						}
 					}
-					return true, false
+					return brFail()
 				}
 				for i, elem := range elems {
 					newB := b.Clone()
 					if Unify(g.Args[0], types.MakeNumber(int64(i+1)), newB) &&
 						Unify(g.Args[2], elem, newB) {
 						if e.solve(rest, newB, callback) {
-							return true, true
+							return brStop(true)
 						}
 					}
 				}
-				return true, false
+				return brFail()
 			}
 
 		case "maplist":
 			if len(g.Args) >= 2 {
-				return true, e.solveMaplist(g, rest, b, callback)
+				return brStop(e.solveMaplist(g, rest, b, callback))
 			}
 
 		case "format":
@@ -971,18 +1074,18 @@ func (e *Engine) tryBuiltin(goal types.Term, rest []types.Term, b Binding, callb
 					}
 					formatted := formatString(a.Name, fmtArgs)
 					fmt.Fprint(e.Output, formatted)
-					return true, e.solve(rest, b, callback)
+					return brContinue(rest, b)
 				}
-				return true, false
+				return brFail()
 			}
 
 		case "ground":
 			if len(g.Args) == 1 {
 				resolved := b.Resolve(g.Args[0])
 				if isGround(resolved) {
-					return true, e.solve(rest, b, callback)
+					return brContinue(rest, b)
 				}
-				return true, false
+				return brFail()
 			}
 
 		case "call":
@@ -998,7 +1101,7 @@ func (e *Engine) tryBuiltin(goal types.Term, rest []types.Term, b Binding, callb
 						}
 						newGoal := types.MakeCompound(comp.Functor, args...)
 						newGoals := append([]types.Term{newGoal}, rest...)
-						return true, e.solve(newGoals, b, callback)
+						return brContinue(newGoals, b)
 					}
 					if a, ok := inner.(*types.Atom); ok {
 						extraArgs := make([]types.Term, len(g.Args)-1)
@@ -1007,13 +1110,13 @@ func (e *Engine) tryBuiltin(goal types.Term, rest []types.Term, b Binding, callb
 						}
 						newGoal := types.MakeCompound(a.Name, extraArgs...)
 						newGoals := append([]types.Term{newGoal}, rest...)
-						return true, e.solve(newGoals, b, callback)
+						return brContinue(newGoals, b)
 					}
 				} else {
 					newGoals := append([]types.Term{inner}, rest...)
-					return true, e.solve(newGoals, b, callback)
+					return brContinue(newGoals, b)
 				}
-				return true, false
+				return brFail()
 			}
 
 		case "listing":
@@ -1025,7 +1128,7 @@ func (e *Engine) tryBuiltin(goal types.Term, rest []types.Term, b Binding, callb
 							fmt.Fprintln(e.Output, c.String())
 						}
 					}
-					return true, e.solve(rest, b, callback)
+					return brContinue(rest, b)
 				}
 				// functor/arity
 				if c, ok := resolved.(*types.Compound); ok && c.Functor == "/" && len(c.Args) == 2 {
@@ -1036,11 +1139,11 @@ func (e *Engine) tryBuiltin(goal types.Term, rest []types.Term, b Binding, callb
 									fmt.Fprintln(e.Output, cl.String())
 								}
 							}
-							return true, e.solve(rest, b, callback)
+							return brContinue(rest, b)
 						}
 					}
 				}
-				return true, false
+				return brFail()
 			}
 
 		case "tab":
@@ -1050,16 +1153,16 @@ func (e *Engine) tryBuiltin(goal types.Term, rest []types.Term, b Binding, callb
 					for i := int64(0); i < n.Value; i++ {
 						fmt.Fprint(e.Output, " ")
 					}
-					return true, e.solve(rest, b, callback)
+					return brContinue(rest, b)
 				}
-				return true, false
+				return brFail()
 			}
 
 		case "succ_or_zero":
 			// Not standard, skip
 		}
 	}
-	return false, false
+	return brNotHandled()
 }
 
 func (e *Engine) evalArith(t types.Term, b Binding) (types.Term, error) {

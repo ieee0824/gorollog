@@ -487,3 +487,103 @@ func contains(ss []string, s string) bool {
 	}
 	return false
 }
+
+// --- Tail Call Optimization tests ---
+
+func TestTCOTailRecursiveCount(t *testing.T) {
+	// count_down(0) :- !.
+	// count_down(N) :- N1 is N - 1, count_down(N1).
+	// This should not stack overflow with TCO.
+	e := loadEngine(`
+		count_down(0) :- !.
+		count_down(N) :- N > 0, N1 is N - 1, count_down(N1).
+	`)
+	b := queryFirst(e, "count_down(10000).")
+	if b == nil {
+		t.Fatal("count_down(10000) failed — likely stack overflow without TCO")
+	}
+}
+
+func TestTCOTailRecursiveFactorial(t *testing.T) {
+	e := loadEngine(`
+		fact(N, F) :- fact(N, 1, F).
+		fact(0, Acc, Acc).
+		fact(N, Acc, F) :- N > 0, Acc1 is Acc * N, N1 is N - 1, fact(N1, Acc1, F).
+	`)
+	b := queryFirst(e, "fact(100, X).")
+	if b == nil {
+		t.Fatal("fact(100, X) failed")
+	}
+}
+
+func TestTCOCutInteraction(t *testing.T) {
+	e := loadEngine(`
+		classify(X, negative) :- X < 0, !.
+		classify(0, zero) :- !.
+		classify(X, positive) :- X > 0.
+	`)
+	b := queryFirst(e, "classify(5, X).")
+	x := b.Resolve(types.MakeVar("X"))
+	if x.String() != "positive" {
+		t.Errorf("expected positive, got %s", x.String())
+	}
+
+	b = queryFirst(e, "classify(-3, X).")
+	x = b.Resolve(types.MakeVar("X"))
+	if x.String() != "negative" {
+		t.Errorf("expected negative, got %s", x.String())
+	}
+
+	b = queryFirst(e, "classify(0, X).")
+	x = b.Resolve(types.MakeVar("X"))
+	if x.String() != "zero" {
+		t.Errorf("expected zero, got %s", x.String())
+	}
+}
+
+func TestTCOIndexAfterAssertRetract(t *testing.T) {
+	e := loadEngine("")
+	query(e, "assert(color(red)).")
+	query(e, "assert(color(green)).")
+	query(e, "assert(color(blue)).")
+	results := query(e, "color(X).")
+	if len(results) != 3 {
+		t.Fatalf("expected 3 results, got %d", len(results))
+	}
+	query(e, "retract(color(green)).")
+	results = query(e, "color(X).")
+	if len(results) != 2 {
+		t.Fatalf("expected 2 results after retract, got %d", len(results))
+	}
+}
+
+func TestTCOMultipleClausesBacktrack(t *testing.T) {
+	e := loadEngine(`
+		f(1). f(2). f(3). f(4). f(5).
+	`)
+	results := query(e, "f(X).")
+	if len(results) != 5 {
+		t.Fatalf("expected 5 results, got %d", len(results))
+	}
+}
+
+func BenchmarkTailRecursiveCount(b *testing.B) {
+	e := loadEngine(`
+		count_down(0) :- !.
+		count_down(N) :- N > 0, N1 is N - 1, count_down(N1).
+	`)
+	for i := 0; i < b.N; i++ {
+		queryFirst(e, "count_down(10000).")
+	}
+}
+
+func BenchmarkFactorial(b *testing.B) {
+	e := loadEngine(`
+		fact(N, F) :- fact(N, 1, F).
+		fact(0, Acc, Acc).
+		fact(N, Acc, F) :- N > 0, Acc1 is Acc * N, N1 is N - 1, fact(N1, Acc1, F).
+	`)
+	for i := 0; i < b.N; i++ {
+		queryFirst(e, "fact(100, X).")
+	}
+}
