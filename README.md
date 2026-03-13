@@ -93,6 +93,80 @@ func main() {
 }
 ```
 
+### io.Reader から Prolog を読み込む
+
+```go
+package main
+
+import (
+	"bytes"
+	"fmt"
+	"io"
+	"os"
+
+	"github.com/ieee0824/gorollog/pkg/engine"
+	"github.com/ieee0824/gorollog/pkg/lexer"
+	"github.com/ieee0824/gorollog/pkg/parser"
+	"github.com/ieee0824/gorollog/pkg/types"
+)
+
+// LoadFromReader は io.Reader から Prolog ソースを読み込みエンジンにロードする
+func LoadFromReader(r io.Reader, e *engine.Engine) error {
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return err
+	}
+	lex := lexer.New(string(data))
+	tokens, err := lex.Tokenize()
+	if err != nil {
+		return err
+	}
+	p := parser.New(tokens)
+	clauses, err := p.ParseProgram()
+	if err != nil {
+		return err
+	}
+	for _, c := range clauses {
+		e.AddClause(c)
+	}
+	return nil
+}
+
+func main() {
+	e := engine.New()
+
+	// bytes.Buffer (io.Reader) からロード
+	program := bytes.NewBufferString(`
+		parent(tom, bob).
+		parent(tom, liz).
+		parent(bob, ann).
+		ancestor(X, Y) :- parent(X, Y).
+		ancestor(X, Y) :- parent(X, Z), ancestor(Z, Y).
+	`)
+	if err := LoadFromReader(program, e); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+
+	// os.Open で .pl ファイルからもロード可能
+	// f, _ := os.Open("examples/family.pl")
+	// defer f.Close()
+	// LoadFromReader(f, e)
+
+	// クエリ実行
+	goal := types.MakeCompound("ancestor", types.MakeAtom("tom"), types.MakeVar("X"))
+	e.Solve([]types.Term{goal}, engine.NewBinding(), func(b engine.Binding) bool {
+		x := b.Resolve(types.MakeVar("X"))
+		fmt.Println(x)
+		return false
+	})
+	// Output:
+	// bob
+	// liz
+	// ann
+}
+```
+
 ### パッケージ構成
 
 | パッケージ | 役割 |
